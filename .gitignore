@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Build and compiler outputs
+built/
+/lib/
+out
+*.onde
+
+# Temporary and test artifacts
+*.tmp
+*.tmp.*
+tests/bin/
+arena/bin/
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
