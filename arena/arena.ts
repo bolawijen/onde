@@ -16,12 +16,27 @@ interface BenchTarget {
   size: number;
 }
 
-interface BenchResult {
-  name: string;
-  meanMs: number;
-  minMs: number;
-  maxMs: number;
+// Warm-run timings, all in milliseconds.
+interface Timings {
+  mean: number;
+  min: number;
+  max: number;
+  median: number;
+  stddev: number;
+}
+
+// One-shot resource profile from the first (cold) execution of a target.
+interface Resources {
+  coldMs: number;
   rssKb: number;
+  pageFaults: number;
+  userMs: number;
+  sysMs: number;
+  instructions: number;
+}
+
+interface BenchResult extends Timings, Resources {
+  name: string;
   sizeBytes: number;
 }
 
@@ -30,25 +45,76 @@ function toDisplayPath(p: string): string {
   return rel.startsWith(".") ? rel : `./${rel}`;
 }
 
+// "h:mm:ss" / "m:ss.ss" -> milliseconds.
+function parseElapsed(text: string): number {
+  const parts = text.trim().split(":").map(Number);
+  if (parts.length === 3) return (parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000;
+  if (parts.length === 2) return (parts[0] * 60 + parts[1]) * 1000;
+  return 0;
+}
 
-async function getRss(cmd: string[]): Promise<number> {
-  const timeCmd = ["/usr/bin/time", "-v", ...cmd];
+// Run `cmd` once under /usr/bin/time -v and harvest the resource profile:
+// wall time, peak RSS, page faults and user+system CPU time. This first run
+// doubles as the cold-start measurement (no warmup).
+async function profileRun(cmd: string[], wantInstructions: boolean): Promise<Resources> {
+  const res: Resources = { coldMs: 0, rssKb: 0, pageFaults: 0, userMs: 0, sysMs: 0, instructions: 0 };
   try {
-    const proc = Bun.spawn(timeCmd, {
+    const proc = Bun.spawn(["/usr/bin/time", "-v", ...cmd], { stdout: "ignore", stderr: "pipe" });
+    const err = await new Response(proc.stderr).text();
+    await proc.exited;
+
+    const rss = err.match(/Maximum resident set size \(kbytes\):\s*(\d+)/);
+    const el = err.match(/Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*([\d:.]+)/);
+    const user = err.match(/User time \(seconds\):\s*([\d.]+)/);
+    const sys = err.match(/System time \(seconds\):\s*([\d.]+)/);
+    const minor = err.match(/Minor \([^)]*\) page faults:\s*(\d+)/);
+    const major = err.match(/Major \([^)]*\) page faults:\s*(\d+)/);
+
+    if (rss) res.rssKb = parseInt(rss[1], 10);
+    if (el) res.coldMs = parseElapsed(el[1]);
+    if (user) res.userMs = parseFloat(user[1]) * 1000;
+    if (sys) res.sysMs = parseFloat(sys[1]) * 1000;
+    res.pageFaults = (minor ? parseInt(minor[1], 10) : 0) + (major ? parseInt(major[1], 10) : 0);
+  } catch {}
+
+  if (wantInstructions) res.instructions = await getInstructions(cmd);
+  return res;
+}
+
+// `perf stat` is gated behind kernel perms (perf_event_paranoid); probe once so
+// an unprivileged host simply skips the retired-instruction metric.
+let perfAvailable: boolean | null = null;
+async function hasPerf(): Promise<boolean> {
+  if (perfAvailable !== null) return perfAvailable;
+  try {
+    const proc = Bun.spawn(["perf", "stat", "-e", "instructions", "true"], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    await proc.exited;
+    perfAvailable = proc.exitCode === 0;
+  } catch {
+    perfAvailable = false;
+  }
+  return perfAvailable;
+}
+
+async function getInstructions(cmd: string[]): Promise<number> {
+  try {
+    const proc = Bun.spawn(["perf", "stat", "-x,", "-e", "instructions", "--", ...cmd], {
       stdout: "ignore",
       stderr: "pipe",
     });
-    const stderr = await new Response(proc.stderr).text();
+    const err = await new Response(proc.stderr).text();
     await proc.exited;
-
-    const match = stderr.match(/Maximum resident set size \(kbytes\):\s*(\d+)/);
-    return match ? parseInt(match[1], 10) : 0;
+    const m = err.match(/^(\d+),/m);
+    return m ? parseInt(m[1], 10) : 0;
   } catch {
     return 0;
   }
 }
 
-async function runHyperfine(targets: BenchTarget[]): Promise<Map<string, { mean: number; min: number; max: number }>> {
+async function runHyperfine(targets: BenchTarget[]): Promise<Map<string, Timings>> {
   const jsonOut = join(binDir, "bench_results.json");
 
   const hfArgs: string[] = [
@@ -67,7 +133,7 @@ async function runHyperfine(targets: BenchTarget[]): Promise<Map<string, { mean:
   const proc = Bun.spawn(hfArgs, { stdout: "inherit", stderr: "inherit" });
   await proc.exited;
 
-  const results = new Map<string, { mean: number; min: number; max: number }>();
+  const results = new Map<string, Timings>();
   if (existsSync(jsonOut)) {
     const raw = JSON.parse(await Bun.file(jsonOut).text());
     for (let i = 0; i < targets.length; i++) {
@@ -77,6 +143,8 @@ async function runHyperfine(targets: BenchTarget[]): Promise<Map<string, { mean:
           mean: res.mean * 1000,
           min: res.min * 1000,
           max: res.max * 1000,
+          median: res.median * 1000,
+          stddev: res.stddev * 1000,
         });
       }
     }
@@ -95,6 +163,28 @@ async function getVersion(bin: string, args: string[] = ["--version"]): Promise<
   }
 }
 
+function sizeStr(bytes: number): string {
+  if (bytes <= 0) return "-";
+  return bytes < 1024 * 1024 ? `${bytes} B` : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+async function build(
+  label: string,
+  cmd: string[],
+  outPath: string,
+): Promise<number> {
+  try {
+    const proc = Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore" });
+    await proc.exited;
+    if (existsSync(outPath)) {
+      const size = statSync(outPath).size;
+      console.log(`  ✓ ${label}: ${sizeStr(size)}`);
+      return size;
+    }
+  } catch {}
+  return 0;
+}
+
 async function runArena(testCasePath: string) {
   const caseAbs = resolve(testCasePath);
   const caseName = basename(caseAbs);
@@ -107,6 +197,9 @@ async function runArena(testCasePath: string) {
   const nodeVersion = nodeBin ? await getVersion("node") : "";
   const tsgoBin = process.env.TSGO_BIN || (await Bun.which("tsgo"));
   const tsgoVersion = tsgoBin && existsSync(tsgoBin) ? await getVersion(tsgoBin, ["version"]) : "";
+  const denoBin = await Bun.which("deno");
+  const denoVersion = denoBin ? (await getVersion("deno", ["--version"])).split("\n")[0] : "";
+  const perfOk = await hasPerf();
 
   console.log(`\n======================================================`);
   console.log(`🏟️  ONDE ARENA SHOWDOWN: ${caseName}`);
@@ -114,124 +207,135 @@ async function runArena(testCasePath: string) {
   console.log(`  • onde:  native x86_64 ELF compiler`);
   console.log(`  • bun:   ${bunVersion}`);
   if (nodeVersion) console.log(`  • node:  ${nodeVersion}`);
+  if (denoVersion) console.log(`  • deno:  ${denoVersion}`);
   if (tsgoVersion) console.log(`  • tsgo:  ${tsgoVersion}`);
+  console.log(`  • perf:  ${perfOk ? "retired instructions enabled" : "unavailable (skipping)"}`);
   console.log(`------------------------------------------------------`);
 
   // 1. Compile targets
-  console.log(`[1/3] Compiling targets...`);
+  console.log(`[1/4] Compiling targets...`);
   const ondeCompiler = join(rootDir, "src", "onde.ts");
   const compileProc = Bun.spawn(["bun", ondeCompiler, caseAbs, "-o", elfPath], {
     stdout: "pipe",
     stderr: "inherit",
   });
   await compileProc.exited;
-
   const elfSize = existsSync(elfPath) ? statSync(elfPath).size : 0;
-  console.log(`  ✓ onde ELF generated: ${elfSize} bytes`);
+  console.log(`  ✓ onde native ELF: ${sizeStr(elfSize)}`);
 
-  // Compile with Bun AOT
   const bunAotPath = join(binDir, `${caseName}.bun-aot.elf`);
-  const bunAotDisplay = toDisplayPath(bunAotPath);
-  let bunAotSize = 0;
-  try {
-    const bunAotProc = Bun.spawn([
-      "bun", "build", "--compile", "--aot", caseAbs, "--outfile", bunAotPath,
-    ], { stdout: "ignore", stderr: "ignore" });
-    await bunAotProc.exited;
-    if (existsSync(bunAotPath)) {
-      bunAotSize = statSync(bunAotPath).size;
-      console.log(`  ✓ bun --aot binary generated: ${(bunAotSize / (1024 * 1024)).toFixed(1)} MB`);
-    }
-  } catch {}
+  const bunAotSize = elfSize > 0
+    ? await build("bun --aot", ["bun", "build", "--compile", "--aot", caseAbs, "--outfile", bunAotPath], bunAotPath)
+    : 0;
 
-  // Targets
+  const bunCcPath = join(binDir, `${caseName}.bun-cc.elf`);
+  const bunCcSize = elfSize > 0
+    ? await build("bun --compile", ["bun", "build", "--compile", caseAbs, "--outfile", bunCcPath], bunCcPath)
+    : 0;
+
+  // C baseline: only when a sibling .c source exists next to the case.
+  const cSource = join(casesDir, caseName.replace(/\.ts$/, ".c"));
+  const ccPath = join(binDir, `${caseName}.cc`);
+  const ccSize = existsSync(cSource)
+    ? await build("cc -O2", ["cc", "-O2", "-o", ccPath, cSource], ccPath)
+    : 0;
+
+  // 2. Assemble targets
   const targets: BenchTarget[] = [
     { name: "onde (native ELF)", cmd: [elfDisplay], size: elfSize },
   ];
-
-  if (bunAotSize > 0) {
-    targets.push({ name: `bun --aot (${bunVersion})`, cmd: [bunAotDisplay], size: bunAotSize });
-  }
-
-  targets.push({ name: `bun run (${bunVersion})`, cmd: ["bun", caseDisplay], size: statSync(process.execPath).size });
-
+  if (bunAotSize > 0) targets.push({ name: `bun --aot`, cmd: [toDisplayPath(bunAotPath)], size: bunAotSize });
+  if (bunCcSize > 0) targets.push({ name: `bun --compile`, cmd: [toDisplayPath(bunCcPath)], size: bunCcSize });
+  if (ccSize > 0) targets.push({ name: `cc -O2 (C)`, cmd: [toDisplayPath(ccPath)], size: ccSize });
+  targets.push({ name: `bun run`, cmd: ["bun", caseDisplay], size: statSync(process.execPath).size });
   if (nodeBin) {
     const nodeCmd = ["node"];
-    if (caseAbs.endsWith(".ts")) {
-      nodeCmd.push("--experimental-strip-types", "--no-warnings");
-    }
+    if (caseAbs.endsWith(".ts")) nodeCmd.push("--experimental-strip-types", "--no-warnings");
     nodeCmd.push(caseDisplay);
     targets.push({ name: `node (${nodeVersion})`, cmd: nodeCmd, size: 0 });
   }
+  if (denoBin) targets.push({ name: `deno (${denoVersion})`, cmd: [denoBin, "run", caseDisplay], size: statSync(denoBin).size });
+  if (tsgoBin && existsSync(tsgoBin)) targets.push({ name: `tsgo`, cmd: [tsgoBin, caseDisplay], size: statSync(tsgoBin).size });
 
-  if (tsgoBin && existsSync(tsgoBin)) {
-    targets.push({
-      name: `tsgo (${tsgoVersion || "latest"})`,
-      cmd: [tsgoBin, caseDisplay],
-      size: statSync(tsgoBin).size,
-    });
-  }
-
-  // 2. Measure Memory RSS
-  console.log(`[2/3] Measuring Peak Memory RSS (KB)...`);
-  const rssMap = new Map<string, number>();
+  // 3. Cold-start + resource profile
+  console.log(`[2/4] Profiling cold start, RSS, page faults and CPU time...`);
+  const resMap = new Map<string, Resources>();
   for (const t of targets) {
-    const rss = await getRss(t.cmd);
-    rssMap.set(t.name, rss);
-    console.log(`  • ${t.name}: ${rss.toLocaleString()} KB`);
+    const r = await profileRun(t.cmd, perfOk);
+    resMap.set(t.name, r);
+    console.log(`  • ${t.name}: cold ${r.coldMs.toFixed(2)} ms, ${r.rssKb.toLocaleString()} KB, ${r.pageFaults.toLocaleString()} faults`);
   }
 
-  // 3. Measure Execution Speed via Hyperfine
-  console.log(`[3/3] Benchmarking execution speed (Hyperfine 50 runs)...`);
+  // 4. Warm execution speed
+  console.log(`[3/4] Benchmarking warm execution speed (Hyperfine 50 runs)...`);
   const timingMap = await runHyperfine(targets);
 
-  // Print Summary Table
   const results: BenchResult[] = targets.map((t) => {
-    const timing = timingMap.get(t.name) || { mean: 0, min: 0, max: 0 };
-    return {
-      name: t.name,
-      meanMs: timing.mean,
-      minMs: timing.min,
-      maxMs: timing.max,
-      rssKb: rssMap.get(t.name) || 0,
-      sizeBytes: t.size,
-    };
+    const timing = timingMap.get(t.name) || { mean: 0, min: 0, max: 0, median: 0, stddev: 0 };
+    const res = resMap.get(t.name)!;
+    return { name: t.name, ...timing, ...res, sizeBytes: t.size };
   });
 
   const ondeRes = results.find((r) => r.name.startsWith("onde"));
-  console.log(`\n🏆 BENCHMARK RESULTS:`);
-  console.log(`---------------------------------------------------------------------------------------`);
+
+  console.log(`\n⏱️  WARM TIMINGS:`);
+  console.log("-------------------------------------------------------------------------------------------");
   console.log(
-    `Runtime / Target`.padEnd(24) +
-    `Mean Time (ms)`.padStart(16) +
-    `Peak RSS (KB)`.padStart(16) +
-    `Size`.padStart(14) +
-    `Speedup vs onde`.padStart(18)
+    `Runtime / Target`.padEnd(22) +
+    `Mean`.padStart(11) + `Median`.padStart(11) + `Stddev`.padStart(11) +
+    `Min`.padStart(11) + `Max`.padStart(11) + `vs onde`.padStart(13)
   );
-  console.log(`---------------------------------------------------------------------------------------`);
-
+  console.log("-------------------------------------------------------------------------------------------");
   for (const r of results) {
-    const speedRatio = ondeRes && r.meanMs > 0 ? (r.meanMs / ondeRes.meanMs).toFixed(1) + "x slower" : "1.0x (baseline)";
-    const sizeStr = r.sizeBytes > 0 ? (r.sizeBytes < 1024 * 1024 ? `${r.sizeBytes} B` : `${(r.sizeBytes / (1024 * 1024)).toFixed(1)} MB`) : "-";
-
+    const ratio = ondeRes && r.mean > 0 && r !== ondeRes ? (r.mean / ondeRes.mean).toFixed(1) + "x" : "-";
     console.log(
-      r.name.padEnd(24) +
-      `${r.meanMs.toFixed(3)} ms`.padStart(16) +
-      `${r.rssKb.toLocaleString()} KB`.padStart(16) +
-      sizeStr.padStart(14) +
-      (r === ondeRes ? "1.0x (FASTEST)".padStart(18) : speedRatio.padStart(18))
+      r.name.padEnd(22) +
+      `${r.mean.toFixed(3)}ms`.padStart(11) +
+      `${r.median.toFixed(3)}ms`.padStart(11) +
+      `${r.stddev.toFixed(3)}ms`.padStart(11) +
+      `${r.min.toFixed(3)}ms`.padStart(11) +
+      `${r.max.toFixed(3)}ms`.padStart(11) +
+      ratio.padStart(13)
     );
   }
-  console.log(`---------------------------------------------------------------------------------------`);
+  console.log("-------------------------------------------------------------------------------------------");
 
-  const primaryRival = results.find((r) => r.name.includes("bun --aot")) || results.find((r) => r.name.includes("bun run"));
-  if (ondeRes && primaryRival) {
-    const speedup = (primaryRival.meanMs / ondeRes.meanMs).toFixed(1);
+  console.log(`\n🧠 COLD START & RESOURCES:`);
+  console.log("-------------------------------------------------------------------------------------------");
+  console.log(
+    `Runtime / Target`.padEnd(22) +
+    `Cold`.padStart(11) + `Peak RSS`.padStart(12) + `Faults`.padStart(10) +
+    `User`.padStart(10) + `Sys`.padStart(9) + `Size`.padStart(12) +
+    (perfOk ? `Instr`.padStart(14) : "")
+  );
+  console.log("-------------------------------------------------------------------------------------------");
+  for (const r of results) {
+    const instrCol = perfOk ? `${(r.instructions / 1e6).toFixed(1)}M`.padStart(14) : "";
+    console.log(
+      r.name.padEnd(22) +
+      `${r.coldMs.toFixed(2)}ms`.padStart(11) +
+      `${r.rssKb.toLocaleString()} KB`.padStart(12) +
+      `${r.pageFaults.toLocaleString()}`.padStart(10) +
+      `${r.userMs.toFixed(1)}ms`.padStart(10) +
+      `${r.sysMs.toFixed(1)}ms`.padStart(9) +
+      sizeStr(r.sizeBytes).padStart(12) +
+      instrCol
+    );
+  }
+  console.log("-------------------------------------------------------------------------------------------");
+
+  const primaryRival =
+    results.find((r) => r.name.includes("bun --aot")) ||
+    results.find((r) => r.name.includes("bun --compile")) ||
+    results.find((r) => r.name.includes("bun run"));
+  if (ondeRes && ondeRes.mean > 0 && primaryRival && primaryRival.mean > 0) {
+    const speedup = (primaryRival.mean / ondeRes.mean).toFixed(1);
     const memRatio = (primaryRival.rssKb / Math.max(ondeRes.rssKb, 1)).toFixed(1);
     console.log(`\n💥 SUMMARY:`);
-    console.log(`  • onde is ${speedup}x FASTER than ${primaryRival.name}`);
-    console.log(`  • onde uses ${memRatio}x LESS RAM than ${primaryRival.name}`);
-    console.log(`  • onde binary footprint: ${elfSize} bytes only!\n`);
+    console.log(`  • onde is ${speedup}x faster than ${primaryRival.name} (warm mean)`);
+    console.log(`  • onde uses ${memRatio}x less RAM than ${primaryRival.name}`);
+    console.log(`  • onde cold start: ${ondeRes.coldMs.toFixed(2)} ms, binary footprint: ${sizeStr(elfSize)}`);
+    console.log("");
   }
 }
 

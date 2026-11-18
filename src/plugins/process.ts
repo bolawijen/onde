@@ -1,21 +1,39 @@
-import { SYS_EXIT } from "../syscall";
-import { CompilerContext } from "../types";
+import { CompilerContext } from "../internals/context";
+import { plugin } from "../plugin";
+import { emitExit, emitExitReg } from "../syscall";
+import { ARG_REGISTER, readArgCount, readArgKind, readArgNumber, readArgValue } from "../internals/args";
 
-const OPCODE_LENGTH = 9
-
-export function exit(ctx: CompilerContext): void {
-  ctx.exitCall = true
-  ctx.codeLength += OPCODE_LENGTH
-  ctx.instructs.push(
-    0xb8, SYS_EXIT, 0x00, 0x00, 0x00,
-    0x31, 0xff,
-    0x0f, 0x05,
-  )
+export function exit(argList: number, ctx: CompilerContext): void {
+  const count = readArgCount(argList, ctx);
+  if (count === undefined || count > 1)
+    throw new TypeError("process.exit accepts at most one numeric literal");
+  if (count === 0) {
+    emitExit(ctx);
+    return;
+  }
+  const kind = readArgKind(argList, 0, ctx);
+  if (kind === ARG_REGISTER) {
+    const reg = readArgValue(argList, 0, ctx);
+    if (reg === undefined || reg < 12 || reg > 15)
+      throw new TypeError("process.exit code register must be a variable in r12-r15");
+    emitExitReg(reg, ctx);
+    return;
+  }
+  const code = readArgNumber(argList, 0, ctx);
+  if (code === undefined)
+    throw new TypeError("process.exit code must be a numeric literal or variable");
+  emitExit(ctx, code);
 }
 
-export function cwd(ctx: CompilerContext): void {
+export function cwd(_argList: number, _ctx: CompilerContext): void {
 }
 
+plugin({
+  name: "process",
+  setup(build) {
+    build.module("process", "object", { exit, cwd });
+  },
+});
 
 // Ganti dengan yang benar:
 
@@ -91,4 +109,3 @@ export function cwd(ctx: CompilerContext): void {
 // **Cache = `r13`.** First call = mmap + store. Kalau `cwd()` dipanggil 2x, mmap di-emit 2x (2x 40 bytes). Kalau mau skip mmap di call ke-2, perlu `test r13, r13` + `jz` — tapi itu branch. Untuk MVP (1-2x call), tidak perlu.
 
 // `r13` = callee-saved. Tidak di-clobber oleh syscall. Persist sampai `exit`.
-

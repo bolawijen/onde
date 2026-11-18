@@ -46,5 +46,13 @@
         "test": "bun test tests/compile",
         "arena": "bun arena/arena.ts",
         "bench": "bun arena/arena.ts"
+    },
+    "onde": {
+        "plugins": [
+            "console",
+            "process",
+            "fs",
+            "bun"
+        ]
     }
 }

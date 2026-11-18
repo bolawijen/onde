@@ -1,46 +1,58 @@
 import { test, expect } from "bun:test";
-import { parseImports } from "../harness";
-import * as builtins from "../../src/builtins";
+import { parse } from "../harness";
+import { readIntern } from "../../src/internals/name";
+import { isModule, resolveMember } from "../../src/plugin";
 
 const names = ['openSync', 'writeSync', 'closeSync']
 
 test("importDecl", () => {
-  const imports = parseImports(`import { ${names} } from "fs";`);
+  const ctx = parse(`import { ${names} } from "fs";`);
   for (const name of names)
-    expect(imports[name]).toBe(builtins.fs[name]);
+    expect(ctx.imports.includes(readIntern(name, ctx))).toBeTruthy();
 });
 
 test("import from globals (console, process)", () => {
-  const imports = parseImports(`import { log } from "console"; import { cwd } from 'process'`);
-  expect(imports.log).toBeTruthy();
-  expect(imports.cwd).toBeTruthy();
-});
-
-test("import { nonexist } from 'fs' (name not in builtin → undefined)", () => {
-  const imports = parseImports(`import { nonexist } from "fs";`);
-  expect(imports.nonexist).toBeUndefined();
-});
-
-test("import { openSync } from 'unknown' (module not in builtins → skip)", () => {
-  const imports = parseImports(`import { openSync } from "unknown";`);
-  expect(imports.openSync).toBeUndefined();
+  const ctx = parse(`import { log } from "console"; import { cwd } from 'process'`);
+  expect(ctx.imports.includes(readIntern('log', ctx))).toBeTruthy();
+  expect(ctx.imports.includes(readIntern('cwd', ctx))).toBeTruthy();
 });
 
 test("multiple imports from same module", () => {
-  const imports = parseImports(`
+  const ctx = parse(`
     import { openSync } from "fs";
     import { writeSync, closeSync } from "fs";
   `);
   for (const name of names)
-    expect(imports[name]).toBe(builtins.fs[name]);
+    expect(ctx.imports.includes(readIntern(name, ctx))).toBeTruthy();
 });
 
 test("import from 'process' (builtin)", () => {
-  const imports = parseImports(`import { exit } from "process";`);
-  expect(imports.exit).toBe(builtins.process.exit);
+  const ctx = parse(`import { exit } from "process";`);
+  expect(ctx.imports.includes(readIntern('exit', ctx))).toBeTruthy();
 });
 
-test("no import → empty", () => {
-  const imports = parseImports(`console.log("hilo");`);
-  expect(Object.keys(imports).length).toBe(0);
+test("plugin: enabled console module resolves", () => {
+  const ctx = parse("");
+
+  expect(isModule("console", ctx)).toBe(true);
+});
+
+test("plugin: console log member resolves to a codegen function", () => {
+  const ctx = parse("");
+
+  expect(typeof resolveMember("console", "log", ctx)).toBe("function");
+});
+
+test("plugin: unknown module member does not resolve", () => {
+  const ctx = parse("");
+
+  expect(resolveMember("console", "missing", ctx)).toBeUndefined();
+});
+
+test("plugin: imported named member emits code through the plugin", () => {
+  const ctx = parse('import { log } from "console"; log("plugin");');
+  const id = readIntern("log", ctx);
+
+  expect(ctx.imports.includes(id)).toBe(true);
+  expect(ctx.instructs.length).toBe(22);
 });

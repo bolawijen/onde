@@ -1,5 +1,17 @@
 # Security Policy
 
+## Running Compiled Programs
+
+`onde` is a compiler, not a sandbox. Compiling source does not make it safe to
+run: generated programs execute with the operating-system permissions of the
+process that launches them. Do not run untrusted generated binaries as root or
+with elevated capabilities. The current `fs` plugin rejects setuid, setgid, and
+sticky mode bits, but that is not a substitute for OS-level isolation.
+
+The native backend is experimental and does not yet guarantee memory-safe
+behavior for every accepted TypeScript program. Use an unprivileged account and
+an OS sandbox/container when evaluating untrusted input.
+
 ## Reporting Security Issues
 
 **Please do not report security vulnerabilities through public GitHub issues.**

@@ -34,12 +34,45 @@ All original Microsoft copyright notices and third-party notices are preserved i
 ### Running / Compiling
 
 ```bash
-# Example compilation with Bun
-bun run src/onde.ts tests/hi.ts -o bin/halo.onde
+# Compile with Bun
+bun run src/onde.ts ./tests/hi.ts -o ./bin/hi.onde
 
 # Run the generated native ELF binary (Linux x86_64)
-./bin/halo.onde
+./bin/hi.onde
+
+# Compile with the native onde executable
+./bin/onde ./tests/hi.ts -o ./bin/hi.onde
 ```
+
+### Tests
+
+Run the compiler test suite with Bun:
+
+```bash
+bun test tests/compile
+```
+
+The compile tests are kept in focused cases under `tests/compile`; they cover
+the currently implemented compiler and runtime behavior.
+
+### Development
+
+Build the standalone bootstrap compiler with Bun:
+
+```bash
+bun build --compile ./src/onde.ts --outfile ./bin/onde
+```
+
+Use that compiler to build a target:
+
+```bash
+./bin/onde ./tests/hi.ts -o ./bin/hi.onde
+./bin/hi.onde
+```
+
+Native self-hosting is still experimental. The current compiler does not yet
+emit a working executable when compiling `src/onde.ts`; use the Bun bootstrap
+command above to rebuild `bin/onde`.
 
 ---
 

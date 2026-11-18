@@ -1,19 +1,20 @@
 import ts from "typescript";
-import { walkRoot } from "../src/zimmerframe";
+import zf from "../src/zimmerframe";
+import "../src/plugins/console";
+import "../src/plugins/process";
+import "../src/plugins/fs";
+import "../src/plugins/bun";
+import * as internals from "../src/internals";
+import { loadModules } from "../src/plugin";
 import { rmSync, mkdirSync } from "fs";
+import { CompilerContext } from "../src/internals/context";
 
-export function parseImports(src: string): Record<string, any> {
+export function parse(src: string): CompilerContext {
   const sf = ts.createSourceFile("test.ts", src, ts.ScriptTarget.Latest, true);
-  const ctx: any = {
-    instructs: [],
-    patchIndexes: [],
-    patchOffsets: [],
-    codeLength: 0,
-    imports: {},
-    internPool: [],
-  };
-  walkRoot(sf, ctx)
-  return ctx.imports;
+  const ctx = internals.createContext()
+  ctx.modules = loadModules()
+  zf(ctx).walk(sf)
+  return ctx;
 }
 
 export async function compile(src: string, out: string = "tests/bin/test"): Promise<string> {
